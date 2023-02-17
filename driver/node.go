@@ -311,13 +311,10 @@ func (s *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	// remove device file if target_path is device, unmount target_path otherwise
 	if info.IsDir() {
-		unpublishResp, err := s.op.nodeUnpublishFilesystemVolume(req, device)
-		if err != nil {
-			return unpublishResp, err
-		}
-		return &csi.NodeUnpublishVolumeResponse{}, nil
+		return s.op.nodeUnpublishFilesystemVolume(req, device)
+	} else {
+		return s.op.nodeUnpublishBlockVolume(req)
 	}
-	return s.op.nodeUnpublishBlockVolume(req)
 }
 
 func (d *deviceOperation) removeDevice(device string) error {
