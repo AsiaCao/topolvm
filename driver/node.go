@@ -99,6 +99,14 @@ func (s *nodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if !(isBlockVol || isFsVol) {
 		return nil, status.Errorf(codes.InvalidArgument, "no supported volume capability: %v", req.GetVolumeCapability())
 	}
+	// we only support SINGLE_NODE_WRITER
+	accessMode := req.GetVolumeCapability().GetAccessMode().GetMode()
+	switch accessMode {
+	case csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER:
+	default:
+		modeName := csi.VolumeCapability_AccessMode_Mode_name[int32(accessMode)]
+		return nil, status.Errorf(codes.FailedPrecondition, "unsupported access mode: %s (%d)", modeName, accessMode)
+	}
 
 	var lv *proto.LogicalVolume
 	var err error
@@ -134,14 +142,6 @@ func (d *deviceOperation) nodePublishFilesystemVolume(req *csi.NodePublishVolume
 	mountOption := req.GetVolumeCapability().GetMount()
 	if mountOption.FsType == "" {
 		mountOption.FsType = "ext4"
-	}
-	// we only support SINGLE_NODE_WRITER
-	accessMode := req.GetVolumeCapability().GetAccessMode().GetMode()
-	switch accessMode {
-	case csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER:
-	default:
-		modeName := csi.VolumeCapability_AccessMode_Mode_name[int32(accessMode)]
-		return status.Errorf(codes.FailedPrecondition, "unsupported access mode: %s (%d)", modeName, accessMode)
 	}
 
 	// Find lv and create a block device with it
