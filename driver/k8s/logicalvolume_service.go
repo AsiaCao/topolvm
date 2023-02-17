@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/topolvm/topolvm"
@@ -12,6 +11,7 @@ import (
 	topolvmv1 "github.com/topolvm/topolvm/api/v1"
 	clientwrapper "github.com/topolvm/topolvm/client"
 	"github.com/topolvm/topolvm/getter"
+	"github.com/topolvm/topolvm/lock"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,7 +33,15 @@ type LogicalVolumeService struct {
 	}
 	getter       getter.Interface
 	volumeGetter *volumeGetter
-	mu           sync.Mutex
+
+	// This protects methods using a volume name.
+	// They can be called twice for a same volume name,
+	// but it is not tolerant for concurrent calls.
+	lockByName *lock.LockByID
+
+	// This protects methods using a volume id.
+	// They are not tolerant for concurrent call each other.
+	lockByVolumeID *lock.LockByID
 }
 
 const (
@@ -147,14 +155,20 @@ func NewLogicalVolumeService(mgr manager.Manager) (*LogicalVolumeService, error)
 		writer:       client,
 		getter:       newRetryMissingGetter(client, apiReader),
 		volumeGetter: &volumeGetter{cacheReader: client, apiReader: apiReader},
+
+		lockByName:     lock.NewLockWithID(),
+		lockByVolumeID: lock.NewLockWithID(),
 	}, nil
 }
 
 // CreateVolume creates volume
 func (s *LogicalVolumeService) CreateVolume(ctx context.Context, node, dc, oc, name, sourceName string, requestGb int64) (string, error) {
 	logger.Info("k8s.CreateVolume called", "name", name, "node", node, "size_gb", requestGb, "sourceName", sourceName)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
+	// the lock must be taken first to protect this from concurrent call.
+	s.lockByName.LockByID(name)
+	defer s.lockByName.UnlockByID(name)
+
 	var lv *topolvmv1.LogicalVolume
 	// if the create volume request has no source, proceed with regular lv creation.
 	if sourceName == "" {
@@ -222,6 +236,10 @@ func (s *LogicalVolumeService) CreateVolume(ctx context.Context, node, dc, oc, n
 func (s *LogicalVolumeService) DeleteVolume(ctx context.Context, volumeID string) error {
 	logger.Info("k8s.DeleteVolume called", "volumeID", volumeID)
 
+	// the lock must be taken first to protect this from concurrent call.
+	s.lockByVolumeID.LockByID(volumeID)
+	defer s.lockByVolumeID.UnlockByID(volumeID)
+
 	lv, err := s.GetVolume(ctx, volumeID)
 	if err != nil {
 		if err == ErrVolumeNotFound {
@@ -262,6 +280,11 @@ func (s *LogicalVolumeService) DeleteVolume(ctx context.Context, volumeID string
 // CreateSnapshot creates a snapshot of existing volume.
 func (s *LogicalVolumeService) CreateSnapshot(ctx context.Context, node, dc, sourceVol, sname, accessType string, snapSize resource.Quantity) (string, error) {
 	logger.Info("CreateSnapshot called", "name", sname)
+
+	// the lock must be taken first to protect this from concurrent call.
+	s.lockByName.LockByID(sname)
+	defer s.lockByName.UnlockByID(sname)
+
 	snapshotLV := &topolvmv1.LogicalVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: sname,
@@ -304,15 +327,17 @@ func (s *LogicalVolumeService) CreateSnapshot(ctx context.Context, node, dc, sou
 // ExpandVolume expands volume
 func (s *LogicalVolumeService) ExpandVolume(ctx context.Context, volumeID string, requestGb int64) error {
 	logger.Info("k8s.ExpandVolume called", "volumeID", volumeID, "requestGb", requestGb)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
+	// the lock must be taken first to protect this from concurrent call.
+	s.lockByVolumeID.LockByID(volumeID)
+	defer s.lockByVolumeID.UnlockByID(volumeID)
 
 	lv, err := s.GetVolume(ctx, volumeID)
 	if err != nil {
 		return err
 	}
 
-	err = s.UpdateSpecSize(ctx, volumeID, resource.NewQuantity(requestGb<<30, resource.BinarySI))
+	err = s.updateSpecSize(ctx, volumeID, resource.NewQuantity(requestGb<<30, resource.BinarySI))
 	if err != nil {
 		return err
 	}
@@ -349,12 +374,14 @@ func (s *LogicalVolumeService) ExpandVolume(ctx context.Context, volumeID string
 }
 
 // GetVolume returns LogicalVolume by volume ID.
+// Safety: this may reads intermediate state, but they are filtered out.
 func (s *LogicalVolumeService) GetVolume(ctx context.Context, volumeID string) (*topolvmv1.LogicalVolume, error) {
 	return s.volumeGetter.Get(ctx, volumeID)
 }
 
-// UpdateSpecSize updates .Spec.Size of LogicalVolume.
-func (s *LogicalVolumeService) UpdateSpecSize(ctx context.Context, volumeID string, size *resource.Quantity) error {
+// updateSpecSize updates .Spec.Size of LogicalVolume.
+// Safety: this is only called from other methods which already take lock.
+func (s *LogicalVolumeService) updateSpecSize(ctx context.Context, volumeID string, size *resource.Quantity) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -388,6 +415,10 @@ func (s *LogicalVolumeService) UpdateSpecSize(ctx context.Context, volumeID stri
 
 // UpdateCurrentSize updates .Status.CurrentSize of LogicalVolume.
 func (s *LogicalVolumeService) UpdateCurrentSize(ctx context.Context, volumeID string, size *resource.Quantity) error {
+	// the lock must be taken first to protect this from concurrent call.
+	s.lockByVolumeID.LockByID(volumeID)
+	defer s.lockByVolumeID.UnlockByID(volumeID)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -416,6 +447,7 @@ func (s *LogicalVolumeService) UpdateCurrentSize(ctx context.Context, volumeID s
 }
 
 // waitForStatusUpdate waits for logical volume creation/failure/timeout, whichever comes first.
+// Safety: this is only called from other methods which already take lock.
 func (s *LogicalVolumeService) waitForStatusUpdate(ctx context.Context, name string) (string, error) {
 	for {
 		logger.Info("waiting for setting 'status.volumeID'", "name", name)
