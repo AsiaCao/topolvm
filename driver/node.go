@@ -219,6 +219,11 @@ func (d *deviceOperation) createDeviceIfNeededNoLocked(device string, lv *proto.
 		}
 		fallthrough
 	case unix.ENOENT:
+		err = os.MkdirAll(path.Dir(device), 0755)
+		if err != nil {
+			return status.Errorf(codes.Internal, "mkdir failed: target=%s, error=%v", path.Dir(device), err)
+		}
+
 		devno := unix.Mkdev(lv.DevMajor, lv.DevMinor)
 		if err := filesystem.Mknod(device, devicePermission, int(devno)); err != nil {
 			return status.Errorf(codes.Internal, "mknod failed for %s. major=%d, minor=%d, error=%v",
@@ -235,30 +240,10 @@ func (d *deviceOperation) nodePublishBlockVolume(req *csi.NodePublishVolumeReque
 	defer d.mu.Unlock()
 
 	// Find lv and create a block device with it
-	var stat unix.Stat_t
 	targetPath := req.GetTargetPath()
-	err := filesystem.Stat(targetPath, &stat)
-	switch err {
-	case nil:
-		if stat.Rdev == unix.Mkdev(lv.DevMajor, lv.DevMinor) && stat.Mode&devicePermission == devicePermission {
-			return nil
-		}
-		if err := os.Remove(targetPath); err != nil {
-			return status.Errorf(codes.Internal, "failed to remove %s", targetPath)
-		}
-	case unix.ENOENT:
-	default:
-		return status.Errorf(codes.Internal, "failed to stat: %v", err)
-	}
-
-	err = os.MkdirAll(path.Dir(targetPath), 0755)
+	err := d.createDeviceIfNeededNoLocked(targetPath, lv)
 	if err != nil {
-		return status.Errorf(codes.Internal, "mkdir failed: target=%s, error=%v", path.Dir(targetPath), err)
-	}
-
-	devno := unix.Mkdev(lv.DevMajor, lv.DevMinor)
-	if err := filesystem.Mknod(targetPath, devicePermission, int(devno)); err != nil {
-		return status.Errorf(codes.Internal, "mknod failed for %s: error=%v", targetPath, err)
+		return err
 	}
 
 	nodeLogger.Info("NodePublishVolume(block) succeeded",
