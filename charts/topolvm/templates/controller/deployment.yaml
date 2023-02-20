@@ -106,6 +106,7 @@ spec:
             - --feature-gates=Topology=true
             - --leader-election
             - --leader-election-namespace={{ .Release.Namespace }}
+            - --http-endpoint=:9809
             {{- with .Values.controller.storageCapacityTracking.enabled }}
             - --enable-capacity
             - --capacity-ownerref-level=2
@@ -142,6 +143,7 @@ spec:
             - --csi-address=/run/topolvm/csi-topolvm.sock
             - --leader-election
             - --leader-election-namespace={{ .Release.Namespace }}
+            - --http-endpoint=:9811
           volumeMounts:
             - name: socket-dir
               mountPath: /run/topolvm
@@ -164,6 +166,7 @@ spec:
             - --csi-address=/run/topolvm/csi-topolvm.sock
             - --leader-election
             - --leader-election-namespace={{ .Release.Namespace }}
+            - --http-endpoint=:9810
           volumeMounts:
             - name: socket-dir
               mountPath: /run/topolvm
